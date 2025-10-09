@@ -100,18 +100,22 @@ class MSAModel:
         # The shutter bounds are at +-0.23 vertically, +-0.1 horizontally
         return integrate_gaussian(shutter_loc_x, sigma, -0.23, 0.23)*integrate_gaussian(shutter_loc_y, sigma, -0.10, 0.10)
 
-    def evaluate_pointing(self, ra_msa, dec_msa, ang_v3):
-        """Evaluate shutter placement, centering, and flux throughput for a given pointing."""
-        axy = radec_to_Axy(self.ra_sources, self.dec_sources, ra_msa, dec_msa, ang_v3)
+    def evaluate_pointing(self, ra_msa, dec_msa, ang_v3, theta=90):
+        """Evaluate shutter placement, centering, and flux throughput for a given pointing.
+        Theta is the APT DVA param, and an unknown function of APA. See radec_to_Axy docstring."""
+        axy = radec_to_Axy(self.ra_sources, self.dec_sources, ra_msa, dec_msa, ang_v3, theta=theta)
         shutters = find_shutter_from_Axy(axy, self.spline_models)
         available = self.apply_shutter_mask(shutters, self.shutter_mask)
         centered = self.apply_shutter_centration(shutters, self.buffer)
         throughput = self.estimate_slit_flux(shutters, sigma=self.source_radius) * np.where(available & centered, 1.0, 0.0)
         return throughput, shutters
     
-    def obs_status(self, ra_msa, dec_msa, ang_v3):
-        """Determine which sources are successfully observed given a pointing."""
-        throughput, _ = self.evaluate_pointing(ra_msa, dec_msa, ang_v3)
+    def obs_status(self, ra_msa, dec_msa, ang_v3, theta=90):
+        """Determine which sources are successfully observed given a pointing.
+        Theta is the APT DVA param, and an unknown function of APA. See radec_to_Axy docstring.
+        Perhaps for grid search if APA is not changing much, theta can be fixed, or maybe the small corection is not important. 
+        theta=90 is no correction."""
+        throughput, _ = self.evaluate_pointing(ra_msa, dec_msa, ang_v3, theta=theta)
         flux = throughput * self.flux_sources
         detected = flux >= self.flux_threshold
         return detected
@@ -271,8 +275,12 @@ def Axy_to_V23(ax,ay):
     axy = np.array([np.atleast_1d(ax),np.atleast_1d(ay)])
     return np.dot(axy.T, rotation_matrix(-(180.0-PHI)*np.pi/180.0))
 
-def radec_to_Axy(ra, dec, ra_pointing, dec_pointing, pa_v3):
-    """Map (RA, Dec) deg to (ax, ay) for pointing (ra_pointing, dec_pointing, pa_v3)."""
+def radec_to_Axy(ra, dec, ra_pointing, dec_pointing, pa_v3, theta=90):
+    """Map (RA, Dec) deg to (ax, ay) for pointing (ra_pointing, dec_pointing, pa_v3).
+    --update: theta is the APT differential velocity aberration param, retrieved from APT as File->Export->xml file->Search for theta.
+    Theta is a function of the APA in APT, where some date is implicitly assumed to compute the JWST's velocity vector.
+    For full consistency this should probably be applied in the v2v3_to_radec function as well.
+    """
     dra = (ra - ra_pointing)*np.pi/180.0
     dec = dec*np.pi/180.0
     dec_ns = dec_pointing*np.pi/180.0
@@ -282,17 +290,25 @@ def radec_to_Axy(ra, dec, ra_pointing, dec_pointing, pa_v3):
     x = np.cos(dec)*np.sin(dra)/denom    # West to east distance, in arcsec
     y = (np.sin(dec)*np.cos(dec_ns)-np.cos(dec)*np.sin(dec_ns)*np.cos(dra))/denom   # south to north distance
 
+    M_DVA = 1 / (1 - 30/3e5 * np.cos((theta-pa_v3)*np.pi/180)) #somehow subtracting pa_v3 works, idk why
+    x *= M_DVA
+    y *= M_DVA
+
     v3pa = pa_v3*np.pi/180.0
     v2 = np.cos(v3pa)*x - np.sin(v3pa)*y
     v3 = +np.sin(v3pa)*x + np.cos(v3pa)*y   
 
     axy = V23_to_Axy(v2,v3)
+
     return axy
 
 def v2v3_to_radec(v2, v3, ra_p_deg, dec_p_deg, pa_v3_deg):
     """
     Map (v2, v3) arcsec to (RA, Dec) deg for pointing (ra_p, dec_p, pa_v3).
     """
+
+    # Zihao I think the - V2_REF and - V3_REF are not needed here, because v2 and v3 are already relative to the pointing. 
+    # Runnning radec_to_Axy -> Axy_to_V23 -> v2v3_to_radec does not return the original RA, Dec.
     dv2 = v2 - V2_REF
     dv3 = v3 - V3_REF
     th = np.deg2rad(pa_v3_deg)
@@ -438,6 +454,259 @@ def show_msa_result(msa_model, ra_msa, dec_msa, pa_msa, dec_width=0.05, verbose=
                 rotation=np.mod(90 + ang_disp*180/np.pi+90, 180)-90)
     
     plt.show()
+
+
+
+def make_msa_config(shutters, shutter_mask_file, output_csv):
+    """output a csv file representing the MSA configuration that can be imported into APT"""
+
+    flags = np.loadtxt(shutter_mask_file, dtype=int)
+    flags = flags.reshape(4,171,365)
+
+    import csv
+
+    quad, row, col = shutters 
+    row = np.round(row).astype(int)
+    col = np.round(col).astype(int)
+    quad = np.asarray(quad).astype(int)
+
+    arr = np.zeros((4,171,365))
+    for q, r, c in zip(quad, row, col):
+        arr[q-1,r,c] = 1
+    
+    with open(output_csv, "w", newline='') as f:
+        writer = csv.writer(f)
+
+        for ir in range(365):
+            line = np.full(171*2, '1')
+            for jr in range(171):
+                q = 3 
+                i_slitmap = arr[q, jr, ir]
+                i_msa_mask = flags[q, jr, ir]
+                if i_msa_mask == 0: # failed closed
+                    if i_slitmap == 1:
+                        print(f"Warning: shutter at Q{q+1} R{jr} C{ir} is marked open in input but failed closed in operability mask.")
+                    shut_stat = 'x'
+                elif i_msa_mask == 1: # failed open
+                    shut_stat = 's'
+                elif i_msa_mask >= 2: # operable
+                    if i_slitmap == 1:
+                        shut_stat = '0'  # 0 means open for some reason
+                    else:
+                        shut_stat = '1'
+
+                line[jr] = shut_stat
+
+            for jr in range(0, 171):
+                q = 0  
+                i_slitmap = arr[q, jr, ir]
+                i_msa_mask = flags[q, jr, ir]
+                if i_msa_mask == 0: # failed closed
+                    if i_slitmap == 1:
+                        print(f"Warning: shutter at Q{q+1} R{jr} C{ir} is marked open in input but failed closed in operability mask.")
+                    shut_stat = 'x'
+                elif i_msa_mask == 1: # failed open
+                    shut_stat = 's'
+                elif i_msa_mask >= 2: # operable
+                    if i_slitmap == 1:
+                        shut_stat = '0'  # 0 means open for some reason
+                    else:
+                        shut_stat = '1'
+
+                line[jr+171] = shut_stat
+
+            writer.writerow(line)
+
+        for ir in range(365):
+            line = np.full(171*2, '1')
+            for jr in range(171):
+                q = 1 
+                i_slitmap = arr[q, jr, ir]
+                i_msa_mask = flags[q, jr, ir]
+                if i_msa_mask == 0: # failed closed
+                    if i_slitmap == 1:
+                        print(f"Warning: shutter at Q{q+1} R{jr} C{ir} is marked open in input but failed closed in operability mask.")
+                    shut_stat = 'x'
+                elif i_msa_mask == 1: # failed open
+                    shut_stat = 's'
+                elif i_msa_mask >= 2: # operable
+                    if i_slitmap == 1:
+                        shut_stat = '0'  # 0 means open for some reason
+                    else:
+                        shut_stat = '1'
+
+                line[jr] = shut_stat
+
+            for jr in range(0, 171): 
+                q = 2 
+                i_slitmap = arr[q, jr, ir]
+                i_msa_mask = flags[q, jr, ir]
+                if i_msa_mask == 0: # failed closed
+                    if i_slitmap == 1:
+                        print(f"Warning: shutter at Q{q+1} R{jr} C{ir} is marked open in input but failed closed in operability mask.")
+                    shut_stat = 'x'
+                elif i_msa_mask == 1: # failed open
+                    shut_stat = 's'
+                elif i_msa_mask >= 2: # operable
+                    if i_slitmap == 1:
+                        shut_stat = '0'  # 0 means open for some reason
+                    else:
+                        shut_stat = '1'
+
+                line[jr+171] = shut_stat
+
+            writer.writerow(line)
+
+    return
+
+def check_model(mpt_output_file, pointing, spline_models, theta):
+    """Compare MPT output with model predictions and plot discrepancies.
+    mpt_output_file is retrieved from APT as File->Export->MSA target info.
+    theta is the APT differential velocity aberration param, retrieved from APT as File->Export->xml file->Search for theta.
+    """
+
+    import pandas as pd
+    import seaborn as sns
+
+    mpt_output = pd.read_csv(mpt_output_file)
+    mpt_cols = mpt_output[' Column (Disp)']
+    mpt_cols_offset = mpt_output[' Offset (x)']
+    mpt_rows = mpt_output[' Row (Spat)']
+    mpt_rows_offset = mpt_output[' Offset (y)']
+    mpt_quads = mpt_output[' Quadrant']
+    mpt_ra = mpt_output[' Source RA (Degrees)']
+    mpt_dec = mpt_output[' Source Dec (Degrees)']
+    hmpt_axy = radec_to_Axy(mpt_ra, mpt_dec, pointing[0], pointing[1], pointing[2], theta)
+    hmpt_quads, hmpt_rows, hmpt_columns = find_shutter_from_Axy(hmpt_axy, spline_models)
+
+    quad_mask = ~(hmpt_quads < 1)
+
+    print(f'{np.sum(1-quad_mask)} sources were marked out of bounds (quad<1)')
+    print(f'{np.sum((hmpt_quads[quad_mask]-1)==mpt_quads[quad_mask])} quadrants are different between hMPT and MPT')
+
+
+    mpt_rows_float = np.array(mpt_rows-1) + np.array(mpt_rows_offset)
+    mpt_cols_float = np.array(mpt_cols-1) + np.array(mpt_cols_offset)
+
+    hmpt_rows = np.array(hmpt_rows)
+    hmpt_cols = np.array(hmpt_columns)
+
+    delta_rows = hmpt_rows[quad_mask]+0.5 - mpt_rows_float[quad_mask]
+    delta_cols = hmpt_cols[quad_mask]+0.5 - mpt_cols_float[quad_mask]
+
+    print(f'{np.sum(np.abs(delta_rows)>0.5)} sources were off by >0.5 in row')
+    print(f'{np.sum(np.abs(delta_cols)>0.5)} sources were off by >0.5 in col')
+
+    df = pd.DataFrame({
+        'delta_row': delta_rows,
+        'delta_col': delta_cols,
+        'quadrant': mpt_quads[quad_mask],
+    })
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))  # 1 row, 2 columns
+
+    # Boxplot: delta_row vs quadrant
+    sns.boxplot(x='quadrant', y='delta_row', data=df, ax=axes[0])
+    axes[0].set_title('Boxplot of row error (hMPT - MPT) by Quadrant')
+    axes[0].set_xlabel('Quadrant')
+    axes[0].set_ylabel('delta_row')
+    axes[0].set_ylim(-0.1,0.1)
+
+
+    # Boxplot: delta_col vs quadrant
+    sns.boxplot(x='quadrant', y='delta_col', data=df, ax=axes[1])
+    axes[1].set_title('Boxplot of col error (hMPT - MPT) by Quadrant')
+    axes[1].set_xlabel('Quadrant')
+    axes[1].set_ylabel('delta_col')
+    axes[1].set_ylim(-0.1,0.1)
+
+    plt.tight_layout()
+    plt.show()
+
+    return 
+
+def create_padded_catalog(catalog, pointing):
+    """Takes a Table or pd DF catalog and creates a padded catalog to circumvent EoE"""
+
+    import pandas as pd
+
+    ra_center, dec_center = pointing[0], pointing[1]
+
+    ra = catalog['RA'].to_numpy().copy()
+    dec = catalog['DEC'].to_numpy().copy()
+    
+    # How many are on each side of center?
+    n_left  = np.sum(ra <  ra_center)
+    n_right = np.sum(ra >  ra_center)
+    n_below = np.sum(dec < dec_center)
+    n_above = np.sum(dec > dec_center)
+    
+    delta_ra = n_right - n_left
+    delta_dec = n_above - n_below
+
+    # Gather "fakes" in arrays
+    fake_rows = []
+
+    # Add fake center
+    fake_rows.append([-1, ra_center, dec_center, 0.0, 3])
+
+    # Pad RA sides
+    if delta_ra > 0:  # need left padding
+        n = delta_ra
+        ids = -np.arange(2, 2 + n)
+        fake_rows.extend(np.column_stack([ids,
+                                          np.full(n, ra_center - 1),
+                                          np.full(n, dec_center),
+                                          np.zeros(n),
+                                          np.full(n, 3)
+                                         ]))
+    elif delta_ra < 0:  # need right padding
+        n = -delta_ra
+        ids = -np.arange(2, 2 + n)
+        fake_rows.extend(np.column_stack([ids,
+                                          np.full(n, ra_center + 1),
+                                          np.full(n, dec_center),
+                                          np.zeros(n),
+                                          np.full(n, 3)
+                                         ]))
+    next_id = 2 + abs(delta_ra)
+
+    # Pad DEC sides
+    if delta_dec > 0:  # need below padding
+        n = delta_dec
+        ids = -np.arange(next_id, next_id + n)
+        fake_rows.extend(np.column_stack([ids,
+                                          np.full(n, ra_center),
+                                          np.full(n, dec_center - 1),
+                                          np.zeros(n),
+                                          np.full(n, 3)
+                                         ]))
+    elif delta_dec < 0:  # need above padding
+        n = -delta_dec
+        ids = -np.arange(next_id, next_id + n)
+        fake_rows.extend(np.column_stack([ids,
+                                          np.full(n, ra_center),
+                                          np.full(n, dec_center + 1),
+                                          np.zeros(n),
+                                          np.full(n, 3)
+                                         ]))
+
+    # Assemble real data as a numpy array
+    catalog_data = catalog[['ID','RA','DEC','Redshift','Number']].values
+
+    # Stack everything together
+    all_rows = np.vstack([catalog_data] + fake_rows)
+
+    # Re-create DataFrame
+    newcat = pd.DataFrame(
+        all_rows, columns=['ID','RA','DEC','Redshift','Number'])
+
+    # Ensure all columns the same dtype as original; cast ID/Number to int
+    newcat['ID'] = newcat['ID'].astype(int)
+    newcat['Number'] = newcat['Number'].astype(int)
+
+    return newcat
+
 
 
 
