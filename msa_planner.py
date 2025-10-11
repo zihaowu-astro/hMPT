@@ -290,9 +290,10 @@ def radec_to_Axy(ra, dec, ra_pointing, dec_pointing, pa_v3, theta=90):
     x = np.cos(dec)*np.sin(dra)/denom    # West to east distance, in arcsec
     y = (np.sin(dec)*np.cos(dec_ns)-np.cos(dec)*np.sin(dec_ns)*np.cos(dra))/denom   # south to north distance
 
-    M_DVA = 1 / (1 - 30/3e5 * np.cos((theta-pa_v3)*np.pi/180)) #somehow subtracting pa_v3 works, idk why
-    x *= M_DVA
-    y *= M_DVA
+    #M_DVA = 1 / (1 - 30/3e5 * np.cos((theta-pa_v3)*np.pi/180)) #somehow subtracting pa_v3 works, idk why
+    M_DVA = 1 / (1 - 30/3e5 * np.cos(theta*np.pi/180))
+    x /= M_DVA
+    y /= M_DVA
 
     v3pa = pa_v3*np.pi/180.0
     v2 = np.cos(v3pa)*x - np.sin(v3pa)*y
@@ -368,7 +369,8 @@ def find_shutter_from_Axy(axy, distortion_models):
     """Find shutter indices (quadrant, row, col) from aperture coordinates (ax, ay)."""
     axy = axy.reshape(-1, 2)
 
-    row, col = np.full(len(axy), np.nan), np.full(len(axy), np.nan)
+    #row, col = np.full(len(axy), np.nan), np.full(len(axy), np.nan)
+    row, col = np.full(len(axy), 0.0), np.full(len(axy), 0.0) # nan creates issues when applying the mask later
     quad = np.zeros(len(axy), dtype=int)
     
     for q in range(4):
@@ -477,10 +479,11 @@ def make_msa_config(shutters, shutter_mask_file, output_csv):
     with open(output_csv, "w", newline='') as f:
         writer = csv.writer(f)
 
+        # 3, 0, 1, 2
         for ir in range(365):
             line = np.full(171*2, '1')
             for jr in range(171):
-                q = 3 
+                q = 0 
                 i_slitmap = arr[q, jr, ir]
                 i_msa_mask = flags[q, jr, ir]
                 if i_msa_mask == 0: # failed closed
@@ -498,7 +501,7 @@ def make_msa_config(shutters, shutter_mask_file, output_csv):
                 line[jr] = shut_stat
 
             for jr in range(0, 171):
-                q = 0  
+                q = 1  
                 i_slitmap = arr[q, jr, ir]
                 i_msa_mask = flags[q, jr, ir]
                 if i_msa_mask == 0: # failed closed
@@ -520,7 +523,7 @@ def make_msa_config(shutters, shutter_mask_file, output_csv):
         for ir in range(365):
             line = np.full(171*2, '1')
             for jr in range(171):
-                q = 1 
+                q = 2 
                 i_slitmap = arr[q, jr, ir]
                 i_msa_mask = flags[q, jr, ir]
                 if i_msa_mask == 0: # failed closed
@@ -538,7 +541,7 @@ def make_msa_config(shutters, shutter_mask_file, output_csv):
                 line[jr] = shut_stat
 
             for jr in range(0, 171): 
-                q = 2 
+                q = 3 
                 i_slitmap = arr[q, jr, ir]
                 i_msa_mask = flags[q, jr, ir]
                 if i_msa_mask == 0: # failed closed
@@ -627,13 +630,10 @@ def check_model(mpt_output_file, pointing, spline_models, theta):
 
 def create_padded_catalog(catalog, pointing):
     """Takes a Table or pd DF catalog and creates a padded catalog to circumvent EoE"""
-
-    import pandas as pd
-
     ra_center, dec_center = pointing[0], pointing[1]
 
-    ra = catalog['RA'].to_numpy().copy()
-    dec = catalog['DEC'].to_numpy().copy()
+    ra = catalog['RA'].copy()
+    dec = catalog['DEC'].copy()
     
     # How many are on each side of center?
     n_left  = np.sum(ra <  ra_center)
@@ -643,6 +643,9 @@ def create_padded_catalog(catalog, pointing):
     
     delta_ra = n_right - n_left
     delta_dec = n_above - n_below
+
+    if delta_ra == 0 and delta_dec == 0:
+        return catalog  # No padding needed
 
     # Gather "fakes" in arrays
     fake_rows = []
@@ -655,10 +658,10 @@ def create_padded_catalog(catalog, pointing):
         n = delta_ra
         ids = -np.arange(2, 2 + n)
         fake_rows.extend(np.column_stack([ids,
-                                          np.full(n, ra_center - 1),
+                                          np.full(n, ra_center - 1), # We can just do 1 here instead of computing exact tangential 1deg because we are just trying to set the median here
                                           np.full(n, dec_center),
-                                          np.zeros(n),
-                                          np.full(n, 3)
+                                          np.zeros(n), # z=0 for fakes
+                                          np.full(n, 3) # dh_select, set to 3 for fakes
                                          ]))
     elif delta_ra < 0:  # need right padding
         n = -delta_ra
@@ -692,14 +695,14 @@ def create_padded_catalog(catalog, pointing):
                                          ]))
 
     # Assemble real data as a numpy array
-    catalog_data = catalog[['ID','RA','DEC','Redshift','Number']].values
+    catalog_data = catalog['ID','RA','DEC','z_a','dh_select'].to_pandas().values
 
     # Stack everything together
     all_rows = np.vstack([catalog_data] + fake_rows)
 
     # Re-create DataFrame
-    newcat = pd.DataFrame(
-        all_rows, columns=['ID','RA','DEC','Redshift','Number'])
+    newcat = Table(
+        all_rows, names=['ID','RA','DEC','Redshift','Number']) # APT recognizes 'Number' instead of dh_select and Redshift instead of z_a
 
     # Ensure all columns the same dtype as original; cast ID/Number to int
     newcat['ID'] = newcat['ID'].astype(int)
