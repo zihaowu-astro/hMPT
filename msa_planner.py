@@ -24,6 +24,9 @@ NUMS_PER_K = 2 * PAIRS_PER_K
 UNCONSTRAINED = 0
 ENTIRE_OPEN = 0.035
 MIDPOINT = 0.059
+CONSTRAINED = 0.072
+TIGHTLY_CONSTRAINED = 0.091
+
 
 
 class MSAModel:
@@ -33,7 +36,7 @@ class MSAModel:
     """
     def __init__(self, shutter_mask_file, distortion_file,
                  ra_sources, dec_sources,  flux_sources=None, radius_source=0.06,
-                 buffer=ENTIRE_OPEN, flux_threshold=0.5):
+                 buffer=ENTIRE_OPEN, flux_threshold=0.5, slit_length=1):
         """
         buffer: margin from shutter edges (arcsec). Options: UNCONSTRAINED, ENTIRE_OPEN, MIDPOINT
         """
@@ -51,6 +54,7 @@ class MSAModel:
             self.flux_sources = flux_sources
         self.source_radius = radius_source
         self.flux_threshold = flux_threshold
+        self.slit_length = slit_length
 
     def load_shutter_operability(self, filename):
         """Load shutter operability flags and build a boolean mask of usable shutters."""
@@ -81,6 +85,26 @@ class MSAModel:
         """Check if shutters are usable given the operability mask."""
         with np.errstate(invalid='ignore'):
             return usable[np.where(shutters[0]<0,0,shutters[0]), np.rint(shutters[1]).astype(int), np.rint(shutters[2]).astype(int)]
+        
+    def apply_shutter_length(self, shutters, usable, length=3):
+        with np.errstate(invalid='ignore'):
+            mask = np.full(len(shutters[0]), True) 
+            for i in range(-length//2, length//2+1):
+                row_indices = np.rint(shutters[1]).astype(int) + i
+                col_indices = np.rint(shutters[2]).astype(int)
+                quad_indices = np.where(shutters[0]<0, 0, shutters[0])
+                
+                valid_indices = ((row_indices >= 0) & (row_indices < usable.shape[1]) & 
+                            (col_indices >= 0) & (col_indices < usable.shape[2]))
+                
+                current_mask = np.full(len(shutters[0]), False)
+                current_mask[valid_indices] = usable[quad_indices[valid_indices], 
+                                                    row_indices[valid_indices], 
+                                                    col_indices[valid_indices]]
+                
+                mask &= current_mask
+            return mask
+
     
     def apply_shutter_centration(self, shutters, buffer):
         """Check whether sources fall near shutter centers within buffer margins."""
@@ -100,12 +124,13 @@ class MSAModel:
         # The shutter bounds are at +-0.23 vertically, +-0.1 horizontally
         return integrate_gaussian(shutter_loc_x, sigma, -0.23, 0.23)*integrate_gaussian(shutter_loc_y, sigma, -0.10, 0.10)
 
-    def evaluate_pointing(self, ra_msa, dec_msa, ang_v3, theta=90):
+    def evaluate_pointing(self, ra_msa, dec_msa, ang_v3, theta=90   ):
         """Evaluate shutter placement, centering, and flux throughput for a given pointing.
         Theta is the APT DVA param, and an unknown function of APA. See radec_to_Axy docstring."""
         axy = radec_to_Axy(self.ra_sources, self.dec_sources, ra_msa, dec_msa, ang_v3, theta=theta)
         shutters = find_shutter_from_Axy(axy, self.spline_models)
         available = self.apply_shutter_mask(shutters, self.shutter_mask)
+        available &= self.apply_shutter_length(shutters, self.shutter_mask, length=self.slit_length)
         centered = self.apply_shutter_centration(shutters, self.buffer)
         throughput = self.estimate_slit_flux(shutters, sigma=self.source_radius) * np.where(available & centered, 1.0, 0.0)
         return throughput, shutters
@@ -121,18 +146,35 @@ class MSAModel:
         return detected
 
 class MSAOptimizer:
-    def __init__(self, msa_model, weights=None):
+    def __init__(self, msa_model, weights=None, objective='number'):
         self.mas_model = msa_model
         if weights is None:
             self.weights = np.ones(len(msa_model.ra_sources))
         else:
             self.weights = weights
 
-    def _objective_function(self, params):
+        self.objective = objective
+        if objective == 'number':
+            self._objective_function = self._objective_function_number
+        elif objective == 'flux':
+            self._objective_function = self._objective_function_flux
+        else:
+            raise ValueError("Objective must be 'number' or 'flux'")
+
+    def _objective_function_number(self, params):
         """ Objective function to be minimized (negative of number of detected sources)."""
         try:
             detected = self.mas_model.obs_status(*params)
             return -np.sum(detected * self.weights)  # number of successful sources (to be maximized)
+        except Exception as e:
+            return 1e6
+    
+    def _objective_function_flux(self, params):
+        """ Objective function to be minimized (negative of weighted flux of detected sources)."""
+        try:
+            throughput, _ = self.mas_model.evaluate_pointing(*params)
+            flux = throughput * self.mas_model.flux_sources
+            return -np.sum(flux * self.weights)  # weighted flux of successful sources (to be maximized)
         except Exception as e:
             return 1e6
 
@@ -275,7 +317,7 @@ def Axy_to_V23(ax,ay):
     axy = np.array([np.atleast_1d(ax),np.atleast_1d(ay)])
     return np.dot(axy.T, rotation_matrix(-(180.0-PHI)*np.pi/180.0))
 
-def radec_to_Axy(ra, dec, ra_pointing, dec_pointing, pa_v3, theta=90):
+def radec_to_Axy(ra, dec, ra_pointing, dec_pointing, pa_v3, theta=0):
     """Map (RA, Dec) deg to (ax, ay) for pointing (ra_pointing, dec_pointing, pa_v3).
     --update: theta is the APT differential velocity aberration param, retrieved from APT as File->Export->xml file->Search for theta.
     Theta is a function of the APA in APT, where some date is implicitly assumed to compute the JWST's velocity vector.
@@ -290,10 +332,9 @@ def radec_to_Axy(ra, dec, ra_pointing, dec_pointing, pa_v3, theta=90):
     x = np.cos(dec)*np.sin(dra)/denom    # West to east distance, in arcsec
     y = (np.sin(dec)*np.cos(dec_ns)-np.cos(dec)*np.sin(dec_ns)*np.cos(dra))/denom   # south to north distance
 
-    #M_DVA = 1 / (1 - 30/3e5 * np.cos((theta-pa_v3)*np.pi/180)) #somehow subtracting pa_v3 works, idk why
-    M_DVA = 1 / (1 - 30/3e5 * np.cos(theta*np.pi/180))
-    x /= M_DVA
-    y /= M_DVA
+    M_DVA = 1 / (1 - 30/3e5 * np.cos((theta-pa_v3)*np.pi/180)) #somehow subtracting pa_v3 works, idk why
+    x *= M_DVA
+    y *= M_DVA
 
     v3pa = pa_v3*np.pi/180.0
     v2 = np.cos(v3pa)*x - np.sin(v3pa)*y
@@ -369,8 +410,7 @@ def find_shutter_from_Axy(axy, distortion_models):
     """Find shutter indices (quadrant, row, col) from aperture coordinates (ax, ay)."""
     axy = axy.reshape(-1, 2)
 
-    #row, col = np.full(len(axy), np.nan), np.full(len(axy), np.nan)
-    row, col = np.full(len(axy), 0.0), np.full(len(axy), 0.0) # nan creates issues when applying the mask later
+    row, col = np.full(len(axy), np.nan), np.full(len(axy), np.nan)
     quad = np.zeros(len(axy), dtype=int)
     
     for q in range(4):
@@ -426,8 +466,8 @@ def show_msa_result(msa_model, ra_msa, dec_msa, pa_msa, dec_width=0.05, verbose=
     if verbose:
         aperture_pa =  (180 - PHI) + pa_msa
         coord = SkyCoord(ra=ra_msa*u.deg, dec=dec_msa*u.deg, frame='icrs')
-        print(f"MSA pointing: RA={ra_msa:.8f}, Dec={dec_msa:.8f}, V3_PA={pa_msa:.4f}")
-        print(f'              {coord.to_string("hmsdms", sep=" ", precision=4)}, Aperture PA: {aperture_pa:.2f} deg')
+        print(f"MSA pointing: RA={ra_msa:.8f}, Dec={dec_msa:.8f}, V3_PA={pa_msa:.6f}")
+        print(f'              {coord.to_string("hmsdms", sep=" ", precision=4)}, Aperture PA: {np.mod(aperture_pa, 360):.6f} deg')
         print(f"Number of sources: {len(ra_sources)}")
         print(f"Number of sources in open shutters: {np.sum(success_mask)}")
 
@@ -479,11 +519,10 @@ def make_msa_config(shutters, shutter_mask_file, output_csv):
     with open(output_csv, "w", newline='') as f:
         writer = csv.writer(f)
 
-        # 3, 0, 1, 2
         for ir in range(365):
             line = np.full(171*2, '1')
             for jr in range(171):
-                q = 0 
+                q = 3 
                 i_slitmap = arr[q, jr, ir]
                 i_msa_mask = flags[q, jr, ir]
                 if i_msa_mask == 0: # failed closed
@@ -501,7 +540,7 @@ def make_msa_config(shutters, shutter_mask_file, output_csv):
                 line[jr] = shut_stat
 
             for jr in range(0, 171):
-                q = 1  
+                q = 0  
                 i_slitmap = arr[q, jr, ir]
                 i_msa_mask = flags[q, jr, ir]
                 if i_msa_mask == 0: # failed closed
@@ -523,7 +562,7 @@ def make_msa_config(shutters, shutter_mask_file, output_csv):
         for ir in range(365):
             line = np.full(171*2, '1')
             for jr in range(171):
-                q = 2 
+                q = 1 
                 i_slitmap = arr[q, jr, ir]
                 i_msa_mask = flags[q, jr, ir]
                 if i_msa_mask == 0: # failed closed
@@ -541,7 +580,7 @@ def make_msa_config(shutters, shutter_mask_file, output_csv):
                 line[jr] = shut_stat
 
             for jr in range(0, 171): 
-                q = 3 
+                q = 2 
                 i_slitmap = arr[q, jr, ir]
                 i_msa_mask = flags[q, jr, ir]
                 if i_msa_mask == 0: # failed closed
@@ -630,10 +669,13 @@ def check_model(mpt_output_file, pointing, spline_models, theta):
 
 def create_padded_catalog(catalog, pointing):
     """Takes a Table or pd DF catalog and creates a padded catalog to circumvent EoE"""
+
+    import pandas as pd
+
     ra_center, dec_center = pointing[0], pointing[1]
 
-    ra = catalog['RA'].copy()
-    dec = catalog['DEC'].copy()
+    ra = catalog['RA'].to_numpy().copy()
+    dec = catalog['DEC'].to_numpy().copy()
     
     # How many are on each side of center?
     n_left  = np.sum(ra <  ra_center)
@@ -643,9 +685,6 @@ def create_padded_catalog(catalog, pointing):
     
     delta_ra = n_right - n_left
     delta_dec = n_above - n_below
-
-    if delta_ra == 0 and delta_dec == 0:
-        return catalog  # No padding needed
 
     # Gather "fakes" in arrays
     fake_rows = []
@@ -658,10 +697,10 @@ def create_padded_catalog(catalog, pointing):
         n = delta_ra
         ids = -np.arange(2, 2 + n)
         fake_rows.extend(np.column_stack([ids,
-                                          np.full(n, ra_center - 1), # We can just do 1 here instead of computing exact tangential 1deg because we are just trying to set the median here
+                                          np.full(n, ra_center - 1),
                                           np.full(n, dec_center),
-                                          np.zeros(n), # z=0 for fakes
-                                          np.full(n, 3) # dh_select, set to 3 for fakes
+                                          np.zeros(n),
+                                          np.full(n, 3)
                                          ]))
     elif delta_ra < 0:  # need right padding
         n = -delta_ra
@@ -695,14 +734,14 @@ def create_padded_catalog(catalog, pointing):
                                          ]))
 
     # Assemble real data as a numpy array
-    catalog_data = catalog['ID','RA','DEC','z_a','dh_select'].to_pandas().values
+    catalog_data = catalog[['ID','RA','DEC','Redshift','Number']].values
 
     # Stack everything together
     all_rows = np.vstack([catalog_data] + fake_rows)
 
     # Re-create DataFrame
-    newcat = Table(
-        all_rows, names=['ID','RA','DEC','Redshift','Number']) # APT recognizes 'Number' instead of dh_select and Redshift instead of z_a
+    newcat = pd.DataFrame(
+        all_rows, columns=['ID','RA','DEC','Redshift','Number'])
 
     # Ensure all columns the same dtype as original; cast ID/Number to int
     newcat['ID'] = newcat['ID'].astype(int)
