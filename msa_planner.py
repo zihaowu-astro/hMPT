@@ -133,7 +133,7 @@ class MSAModel:
         available &= self.apply_shutter_length(shutters, self.shutter_mask, length=self.slit_length)
         centered = self.apply_shutter_centration(shutters, self.buffer)
         throughput = self.estimate_slit_flux(shutters, sigma=self.source_radius) * np.where(available & centered, 1.0, 0.0)
-        return throughput, shutters
+        return throughput, shutters # should mask the shutters?
     
     def obs_status(self, ra_msa, dec_msa, ang_v3, theta=90):
         """Determine which sources are successfully observed given a pointing.
@@ -332,7 +332,11 @@ def radec_to_Axy(ra, dec, ra_pointing, dec_pointing, pa_v3, theta=0):
     x = np.cos(dec)*np.sin(dra)/denom    # West to east distance, in arcsec
     y = (np.sin(dec)*np.cos(dec_ns)-np.cos(dec)*np.sin(dec_ns)*np.cos(dra))/denom   # south to north distance
 
+<<<<<<< HEAD
     M_DVA = 1 / (1 - 30/3e5 * np.cos((theta-pa_v3)*np.pi/180)) #somehow subtracting pa_v3 works, idk why
+=======
+    M_DVA = 1 / (1 - 30/3e5 * np.cos((theta-pa_v3)*np.pi/180)) # theta references to v3pa
+>>>>>>> e575628 (updating apt_setup.ipynb and adding JTSS data)
     x *= M_DVA
     y *= M_DVA
 
@@ -601,7 +605,7 @@ def make_msa_config(shutters, shutter_mask_file, output_csv):
 
     return
 
-def check_model(mpt_output_file, pointing, spline_models, theta):
+def check_model(mpt_output_file, pointing, spline_models, theta, plot=True):
     """Compare MPT output with model predictions and plot discrepancies.
     mpt_output_file is retrieved from APT as File->Export->MSA target info.
     theta is the APT differential velocity aberration param, retrieved from APT as File->Export->xml file->Search for theta.
@@ -639,32 +643,37 @@ def check_model(mpt_output_file, pointing, spline_models, theta):
     print(f'{np.sum(np.abs(delta_rows)>0.5)} sources were off by >0.5 in row')
     print(f'{np.sum(np.abs(delta_cols)>0.5)} sources were off by >0.5 in col')
 
-    df = pd.DataFrame({
-        'delta_row': delta_rows,
-        'delta_col': delta_cols,
-        'quadrant': mpt_quads[quad_mask],
-    })
+    if plot:
+        df = pd.DataFrame({
+            'delta_row': delta_rows,
+            'delta_col': delta_cols,
+            'quadrant': mpt_quads[quad_mask],
+        })
 
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))  # 1 row, 2 columns
+        fig, axes = plt.subplots(1, 2, figsize=(16, 6))  # 1 row, 2 columns
 
-    # Boxplot: delta_row vs quadrant
-    sns.boxplot(x='quadrant', y='delta_row', data=df, ax=axes[0])
-    axes[0].set_title('Boxplot of row error (hMPT - MPT) by Quadrant')
-    axes[0].set_xlabel('Quadrant')
-    axes[0].set_ylabel('delta_row')
-    axes[0].set_ylim(-0.1,0.1)
+        # Boxplot: delta_row vs quadrant
+        sns.boxplot(x='quadrant', y='delta_row', data=df, ax=axes[0])
+        axes[0].set_title('Boxplot of row error (hMPT - MPT) by Quadrant')
+        axes[0].set_xlabel('Quadrant')
+        axes[0].set_ylabel('delta_row')
+        axes[0].set_ylim(-0.1,0.1)
 
 
-    # Boxplot: delta_col vs quadrant
-    sns.boxplot(x='quadrant', y='delta_col', data=df, ax=axes[1])
-    axes[1].set_title('Boxplot of col error (hMPT - MPT) by Quadrant')
-    axes[1].set_xlabel('Quadrant')
-    axes[1].set_ylabel('delta_col')
-    axes[1].set_ylim(-0.1,0.1)
+        # Boxplot: delta_col vs quadrant
+        sns.boxplot(x='quadrant', y='delta_col', data=df, ax=axes[1])
+        axes[1].set_title('Boxplot of col error (hMPT - MPT) by Quadrant')
+        axes[1].set_xlabel('Quadrant')
+        axes[1].set_ylabel('delta_col')
+        axes[1].set_ylim(-0.1,0.1)
 
-    plt.tight_layout()
-    plt.show()
-
+        plt.tight_layout()
+        plt.show()
+    else:
+        quads = mpt_quads[quad_mask]
+        print(f'Median row error by quad: {np.median(delta_rows[quads==1]):.4f}, {np.median(delta_rows[quads==2]):.4f}, {np.median(delta_rows[quads==3]):.4f}, {np.median(delta_rows[quads==4]):.4f}')
+        print(f'Median col error by quad: {np.median(delta_cols[quads==1]):.4f}, {np.median(delta_cols[quads==2]):.4f}, {np.median(delta_cols[quads==3]):.4f}, {np.median(delta_cols[quads==4]):.4f}')
+    
     return 
 
 def create_padded_catalog(catalog, pointing):
