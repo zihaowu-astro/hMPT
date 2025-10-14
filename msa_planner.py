@@ -332,11 +332,7 @@ def radec_to_Axy(ra, dec, ra_pointing, dec_pointing, pa_v3, theta=0):
     x = np.cos(dec)*np.sin(dra)/denom    # West to east distance, in arcsec
     y = (np.sin(dec)*np.cos(dec_ns)-np.cos(dec)*np.sin(dec_ns)*np.cos(dra))/denom   # south to north distance
 
-<<<<<<< HEAD
-    M_DVA = 1 / (1 - 30/3e5 * np.cos((theta-pa_v3)*np.pi/180)) #somehow subtracting pa_v3 works, idk why
-=======
     M_DVA = 1 / (1 - 30/3e5 * np.cos((theta-pa_v3)*np.pi/180)) # theta references to v3pa
->>>>>>> e575628 (updating apt_setup.ipynb and adding JTSS data)
     x *= M_DVA
     y *= M_DVA
 
