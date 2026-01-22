@@ -12,4 +12,4 @@ This package is based on [eMPT](https://github.com/esdc-esac-esa-int/eMPT_v1) re
 
 Authors
 -------
-Daniel Eisenstein, Samuel McCarty, Zihao Wu
+Daniel Eisenstein, Samuel McCarty, Zihao Wu (listed alphabetically)
