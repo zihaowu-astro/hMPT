@@ -1,3 +1,5 @@
+# hMPT: High-performance MSA Planning Tool
+
 Purpose
 -------
 
